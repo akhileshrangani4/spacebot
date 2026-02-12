@@ -1,8 +1,10 @@
 //! Configuration loading and validation.
 
 use crate::error::{ConfigError, Result};
+use crate::llm::routing::RoutingConfig;
 use anyhow::Context as _;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Top-level Spacebot configuration.
@@ -32,9 +34,7 @@ pub struct LlmConfig {
 /// Defaults inherited by all agents. Individual agents can override any field.
 #[derive(Debug, Clone)]
 pub struct DefaultsConfig {
-    pub channel_model: String,
-    pub worker_model: String,
-    pub cortex_model: String,
+    pub routing: RoutingConfig,
     pub max_concurrent_branches: usize,
     pub max_turns: usize,
     pub context_window: usize,
@@ -45,9 +45,7 @@ pub struct DefaultsConfig {
 impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
-            channel_model: "anthropic/claude-sonnet-4-20250514".into(),
-            worker_model: "anthropic/claude-sonnet-4-20250514".into(),
-            cortex_model: "anthropic/claude-sonnet-4-20250514".into(),
+            routing: RoutingConfig::default(),
             max_concurrent_branches: 5,
             max_turns: 5,
             context_window: 128_000,
@@ -102,9 +100,8 @@ pub struct AgentConfig {
     pub default: bool,
     /// Custom workspace path. If None, resolved to instance_dir/agents/{id}/workspace.
     pub workspace: Option<PathBuf>,
-    pub channel_model: Option<String>,
-    pub worker_model: Option<String>,
-    pub cortex_model: Option<String>,
+    /// Per-agent routing overrides. None inherits from defaults.
+    pub routing: Option<RoutingConfig>,
     pub max_concurrent_branches: Option<usize>,
     pub max_turns: Option<usize>,
     pub context_window: Option<usize>,
@@ -119,9 +116,7 @@ pub struct ResolvedAgentConfig {
     pub workspace: PathBuf,
     pub data_dir: PathBuf,
     pub archives_dir: PathBuf,
-    pub channel_model: String,
-    pub worker_model: String,
-    pub cortex_model: String,
+    pub routing: RoutingConfig,
     pub max_concurrent_branches: usize,
     pub max_turns: usize,
     pub context_window: usize,
@@ -142,18 +137,10 @@ impl AgentConfig {
                 .unwrap_or_else(|| agent_root.join("workspace")),
             data_dir: agent_root.join("data"),
             archives_dir: agent_root.join("archives"),
-            channel_model: self
-                .channel_model
+            routing: self
+                .routing
                 .clone()
-                .unwrap_or_else(|| defaults.channel_model.clone()),
-            worker_model: self
-                .worker_model
-                .clone()
-                .unwrap_or_else(|| defaults.worker_model.clone()),
-            cortex_model: self
-                .cortex_model
-                .clone()
-                .unwrap_or_else(|| defaults.cortex_model.clone()),
+                .unwrap_or_else(|| defaults.routing.clone()),
             max_concurrent_branches: self
                 .max_concurrent_branches
                 .unwrap_or(defaults.max_concurrent_branches),
@@ -230,14 +217,26 @@ struct TomlLlmConfig {
 
 #[derive(Deserialize, Default)]
 struct TomlDefaultsConfig {
-    channel_model: Option<String>,
-    worker_model: Option<String>,
-    cortex_model: Option<String>,
+    routing: Option<TomlRoutingConfig>,
     max_concurrent_branches: Option<usize>,
     max_turns: Option<usize>,
     context_window: Option<usize>,
     compaction: Option<TomlCompactionConfig>,
     cortex: Option<TomlCortexConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlRoutingConfig {
+    channel: Option<String>,
+    branch: Option<String>,
+    worker: Option<String>,
+    compactor: Option<String>,
+    cortex: Option<String>,
+    rate_limit_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    task_overrides: HashMap<String, String>,
+    #[serde(default)]
+    fallbacks: HashMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -261,9 +260,7 @@ struct TomlAgentConfig {
     #[serde(default)]
     default: bool,
     workspace: Option<String>,
-    channel_model: Option<String>,
-    worker_model: Option<String>,
-    cortex_model: Option<String>,
+    routing: Option<TomlRoutingConfig>,
     max_concurrent_branches: Option<usize>,
     max_turns: Option<usize>,
     context_window: Option<usize>,
@@ -316,6 +313,30 @@ fn resolve_env_value(value: &str) -> Option<String> {
     }
 }
 
+/// Resolve a TomlRoutingConfig against a base RoutingConfig.
+fn resolve_routing(toml: Option<TomlRoutingConfig>, base: &RoutingConfig) -> RoutingConfig {
+    let Some(t) = toml else { return base.clone() };
+
+    let mut task_overrides = base.task_overrides.clone();
+    task_overrides.extend(t.task_overrides);
+
+    let mut fallbacks = base.fallbacks.clone();
+    fallbacks.extend(t.fallbacks);
+
+    RoutingConfig {
+        channel: t.channel.unwrap_or_else(|| base.channel.clone()),
+        branch: t.branch.unwrap_or_else(|| base.branch.clone()),
+        worker: t.worker.unwrap_or_else(|| base.worker.clone()),
+        compactor: t.compactor.unwrap_or_else(|| base.compactor.clone()),
+        cortex: t.cortex.unwrap_or_else(|| base.cortex.clone()),
+        task_overrides,
+        fallbacks,
+        rate_limit_cooldown_secs: t
+            .rate_limit_cooldown_secs
+            .unwrap_or(base.rate_limit_cooldown_secs),
+    }
+}
+
 impl Config {
     /// Load configuration from the default config file, falling back to env vars.
     pub fn load() -> Result<Self> {
@@ -365,13 +386,20 @@ impl Config {
             .into());
         }
 
+        // Env-only routing: check for env overrides on channel/worker models
+        let mut routing = RoutingConfig::default();
+        if let Ok(channel_model) = std::env::var("SPACEBOT_CHANNEL_MODEL") {
+            routing.channel = channel_model;
+        }
+        if let Ok(worker_model) = std::env::var("SPACEBOT_WORKER_MODEL") {
+            routing.worker = worker_model;
+        }
+
         let agents = vec![AgentConfig {
             id: "main".into(),
             default: true,
             workspace: None,
-            channel_model: std::env::var("SPACEBOT_CHANNEL_MODEL").ok(),
-            worker_model: std::env::var("SPACEBOT_WORKER_MODEL").ok(),
-            cortex_model: None,
+            routing: Some(routing),
             max_concurrent_branches: None,
             max_turns: None,
             context_window: None,
@@ -414,18 +442,7 @@ impl Config {
 
         let base_defaults = DefaultsConfig::default();
         let defaults = DefaultsConfig {
-            channel_model: toml
-                .defaults
-                .channel_model
-                .unwrap_or(base_defaults.channel_model),
-            worker_model: toml
-                .defaults
-                .worker_model
-                .unwrap_or(base_defaults.worker_model),
-            cortex_model: toml
-                .defaults
-                .cortex_model
-                .unwrap_or(base_defaults.cortex_model),
+            routing: resolve_routing(toml.defaults.routing, &base_defaults.routing),
             max_concurrent_branches: toml
                 .defaults
                 .max_concurrent_branches
@@ -473,18 +490,23 @@ impl Config {
         let mut agents: Vec<AgentConfig> = toml
             .agents
             .into_iter()
-            .map(|a| AgentConfig {
-                id: a.id,
-                default: a.default,
-                workspace: a.workspace.map(PathBuf::from),
-                channel_model: a.channel_model,
-                worker_model: a.worker_model,
-                cortex_model: a.cortex_model,
-                max_concurrent_branches: a.max_concurrent_branches,
-                max_turns: a.max_turns,
-                context_window: a.context_window,
-                compaction: None,
-                cortex: None,
+            .map(|a| {
+                // Per-agent routing resolves against instance defaults
+                let agent_routing = a
+                    .routing
+                    .map(|r| resolve_routing(Some(r), &defaults.routing));
+
+                AgentConfig {
+                    id: a.id,
+                    default: a.default,
+                    workspace: a.workspace.map(PathBuf::from),
+                    routing: agent_routing,
+                    max_concurrent_branches: a.max_concurrent_branches,
+                    max_turns: a.max_turns,
+                    context_window: a.context_window,
+                    compaction: None,
+                    cortex: None,
+                }
             })
             .collect();
 
@@ -493,9 +515,7 @@ impl Config {
                 id: "main".into(),
                 default: true,
                 workspace: None,
-                channel_model: None,
-                worker_model: None,
-                cortex_model: None,
+                routing: None,
                 max_concurrent_branches: None,
                 max_turns: None,
                 context_window: None,

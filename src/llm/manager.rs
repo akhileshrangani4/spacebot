@@ -1,15 +1,23 @@
-//! LLM manager for provider routing and model resolution.
+//! LLM manager for provider credentials and HTTP client.
+//!
+//! The manager is intentionally simple — it holds API keys, an HTTP client,
+//! and shared rate limit state. Routing decisions (which model for which
+//! process) live on the agent's RoutingConfig, not here.
 
 use crate::config::LlmConfig;
 use crate::error::{LlmError, Result};
 use anyhow::Context as _;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
 
-/// Manages LLM provider clients and routes requests by model name.
+/// Manages LLM provider clients and tracks rate limit state.
 pub struct LlmManager {
     config: LlmConfig,
-    /// HTTP client for making requests.
     http_client: reqwest::Client,
+    /// Models currently in rate limit cooldown, with the time they were limited.
+    rate_limited: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl LlmManager {
@@ -19,13 +27,14 @@ impl LlmManager {
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .with_context(|| "failed to build HTTP client")?;
-        
+
         Ok(Self {
             config,
             http_client,
+            rate_limited: Arc::new(RwLock::new(HashMap::new())),
         })
     }
-    
+
     /// Get the appropriate API key for a provider.
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         match provider {
@@ -36,20 +45,42 @@ impl LlmManager {
             _ => Err(LlmError::UnknownProvider(provider.into()).into()),
         }
     }
-    
+
     /// Get the HTTP client.
     pub fn http_client(&self) -> &reqwest::Client {
         &self.http_client
     }
-    
+
     /// Resolve a model name to provider and model components.
+    /// Format: "provider/model-name" or just "model-name" (defaults to anthropic).
     pub fn resolve_model(&self, model_name: &str) -> Result<(String, String)> {
-        // Format: "provider/model-name" or just "model-name"
         if let Some((provider, model)) = model_name.split_once('/') {
             Ok((provider.to_string(), model.to_string()))
         } else {
-            // Default to anthropic if no provider specified
             Ok(("anthropic".into(), model_name.into()))
         }
+    }
+
+    /// Record that a model hit a rate limit.
+    pub async fn record_rate_limit(&self, model_name: &str) {
+        self.rate_limited.write().await
+            .insert(model_name.to_string(), Instant::now());
+        tracing::warn!(model = %model_name, "model rate limited, entering cooldown");
+    }
+
+    /// Check if a model is currently in rate limit cooldown.
+    pub async fn is_rate_limited(&self, model_name: &str, cooldown_secs: u64) -> bool {
+        let map = self.rate_limited.read().await;
+        if let Some(limited_at) = map.get(model_name) {
+            limited_at.elapsed().as_secs() < cooldown_secs
+        } else {
+            false
+        }
+    }
+
+    /// Clean up expired rate limit entries.
+    pub async fn cleanup_rate_limits(&self, cooldown_secs: u64) {
+        self.rate_limited.write().await
+            .retain(|_, limited_at| limited_at.elapsed().as_secs() < cooldown_secs);
     }
 }

@@ -1,6 +1,7 @@
 //! SpacebotModel: Custom CompletionModel implementation that routes through LlmManager.
 
 use crate::llm::manager::LlmManager;
+use crate::llm::routing::{self, RoutingConfig, MAX_FALLBACK_ATTEMPTS};
 
 use rig::completion::{
     self, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
@@ -33,22 +34,41 @@ impl GetTokenUsage for RawStreamingResponse {
 }
 
 /// Custom completion model that routes through LlmManager.
+///
+/// Optionally holds a RoutingConfig for fallback behavior. When present,
+/// completion() will try fallback models on retriable errors.
 #[derive(Clone)]
 pub struct SpacebotModel {
     llm_manager: Arc<LlmManager>,
     model_name: String,
     provider: String,
+    full_model_name: String,
+    routing: Option<RoutingConfig>,
 }
 
 impl SpacebotModel {
-    /// Get the provider name.
-    pub fn provider(&self) -> &str {
-        &self.provider
+    pub fn provider(&self) -> &str { &self.provider }
+    pub fn model_name(&self) -> &str { &self.model_name }
+    pub fn full_model_name(&self) -> &str { &self.full_model_name }
+
+    /// Attach routing config for fallback behavior.
+    pub fn with_routing(mut self, routing: RoutingConfig) -> Self {
+        self.routing = Some(routing);
+        self
     }
 
-    /// Get the model name.
-    pub fn model_name(&self) -> &str {
-        &self.model_name
+    /// Direct call to the provider (no fallback logic).
+    async fn attempt_completion(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+        match self.provider.as_str() {
+            "anthropic" => self.call_anthropic(request).await,
+            "openai" => self.call_openai(request).await,
+            other => Err(CompletionError::ProviderError(format!(
+                "unknown provider: {other}"
+            ))),
+        }
     }
 }
 
@@ -62,13 +82,17 @@ impl CompletionModel for SpacebotModel {
         let (provider, model_name) = if let Some((p, m)) = full_name.split_once('/') {
             (p.to_string(), m.to_string())
         } else {
-            ("anthropic".to_string(), full_name)
+            ("anthropic".to_string(), full_name.clone())
         };
+
+        let full_model_name = format!("{provider}/{model_name}");
 
         Self {
             llm_manager: client.clone(),
             model_name,
             provider,
+            full_model_name,
+            routing: None,
         }
     }
 
@@ -76,13 +100,62 @@ impl CompletionModel for SpacebotModel {
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        match self.provider.as_str() {
-            "anthropic" => self.call_anthropic(request).await,
-            "openai" => self.call_openai(request).await,
-            other => Err(CompletionError::ProviderError(format!(
-                "unknown provider: {other}"
-            ))),
+        // Try the primary model
+        match self.attempt_completion(request.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let error_str = error.to_string();
+                if !routing::is_retriable_error(&error_str) || self.routing.is_none() {
+                    return Err(error);
+                }
+
+                tracing::warn!(
+                    model = %self.full_model_name,
+                    %error,
+                    "primary model failed, trying fallbacks"
+                );
+
+                // Record the rate limit on the manager
+                self.llm_manager.record_rate_limit(&self.full_model_name).await;
+            }
         }
+
+        // Try fallback chain
+        let routing = self.routing.as_ref().expect("checked above");
+        let fallbacks = routing.get_fallbacks(&self.full_model_name);
+
+        for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+            let fallback = SpacebotModel::make(&self.llm_manager, fallback_name);
+
+            match fallback.attempt_completion(request.clone()).await {
+                Ok(response) => {
+                    tracing::info!(
+                        original = %self.full_model_name,
+                        fallback = %fallback_name,
+                        attempt = index + 1,
+                        "fallback model succeeded"
+                    );
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let error_str = error.to_string();
+                    if routing::is_retriable_error(&error_str) {
+                        tracing::warn!(
+                            fallback = %fallback_name,
+                            %error,
+                            "fallback also failed, continuing chain"
+                        );
+                        self.llm_manager.record_rate_limit(fallback_name).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Err(CompletionError::ProviderError(
+            "all models in fallback chain failed".into()
+        ))
     }
 
     async fn stream(
