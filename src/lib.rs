@@ -133,7 +133,7 @@ pub struct AgentDeps {
     pub llm_manager: Arc<llm::LlmManager>,
     pub tool_server: rig::tool::server::ToolServerHandle,
     pub routing: llm::RoutingConfig,
-    pub event_tx: tokio::sync::mpsc::Sender<ProcessEvent>,
+    pub event_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
 }
 
 impl AgentDeps {

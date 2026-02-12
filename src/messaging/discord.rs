@@ -17,6 +17,9 @@ use tokio::sync::{RwLock, mpsc};
 pub struct DiscordAdapter {
     token: String,
     guild_filter: Option<Vec<GuildId>>,
+    /// Per-guild channel allowlist. If a guild has an entry, only those channels are processed.
+    /// Guilds without an entry (or with an empty vec) allow all channels.
+    channel_filter: HashMap<GuildId, Vec<ChannelId>>,
     http: Arc<RwLock<Option<Arc<Http>>>>,
     bot_user_id: Arc<RwLock<Option<UserId>>>,
     /// Maps InboundMessage.id to the Discord MessageId being edited during streaming.
@@ -27,10 +30,23 @@ pub struct DiscordAdapter {
 }
 
 impl DiscordAdapter {
-    pub fn new(token: impl Into<String>, guild_filter: Option<Vec<u64>>) -> Self {
+    pub fn new(
+        token: impl Into<String>,
+        guild_filter: Option<Vec<u64>>,
+        channel_filter: HashMap<u64, Vec<u64>>,
+    ) -> Self {
         Self {
             token: token.into(),
             guild_filter: guild_filter.map(|ids| ids.into_iter().map(GuildId::new).collect()),
+            channel_filter: channel_filter
+                .into_iter()
+                .map(|(guild, channels)| {
+                    (
+                        GuildId::new(guild),
+                        channels.into_iter().map(ChannelId::new).collect(),
+                    )
+                })
+                .collect(),
             http: Arc::new(RwLock::new(None)),
             bot_user_id: Arc::new(RwLock::new(None)),
             active_messages: Arc::new(RwLock::new(HashMap::new())),
@@ -73,6 +89,7 @@ impl Messaging for DiscordAdapter {
         let handler = Handler {
             inbound_tx,
             guild_filter: self.guild_filter.clone(),
+            channel_filter: self.channel_filter.clone(),
             http_slot: self.http.clone(),
             bot_user_id_slot: self.bot_user_id.clone(),
         };
@@ -228,6 +245,7 @@ impl Messaging for DiscordAdapter {
 struct Handler {
     inbound_tx: mpsc::Sender<InboundMessage>,
     guild_filter: Option<Vec<GuildId>>,
+    channel_filter: HashMap<GuildId, Vec<ChannelId>>,
     http_slot: Arc<RwLock<Option<Arc<Http>>>>,
     bot_user_id_slot: Arc<RwLock<Option<UserId>>>,
 }
@@ -250,6 +268,16 @@ impl EventHandler for Handler {
         if let Some(filter) = &self.guild_filter {
             if let Some(guild_id) = message.guild_id {
                 if !filter.contains(&guild_id) {
+                    return;
+                }
+            }
+        }
+
+        if let Some(guild_id) = message.guild_id {
+            if let Some(allowed_channels) = self.channel_filter.get(&guild_id) {
+                if !allowed_channels.is_empty()
+                    && !allowed_channels.contains(&message.channel_id)
+                {
                     return;
                 }
             }

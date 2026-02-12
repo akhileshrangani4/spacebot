@@ -172,6 +172,69 @@ pub struct Binding {
     pub channel: String,
     pub guild_id: Option<String>,
     pub chat_id: Option<String>,
+    /// Discord channel IDs this binding applies to. If empty, all channels in the guild are allowed.
+    pub channel_ids: Vec<String>,
+}
+
+impl Binding {
+    /// Check if this binding matches an inbound message.
+    fn matches(&self, message: &crate::InboundMessage) -> bool {
+        if self.channel != message.source {
+            return false;
+        }
+
+        if let Some(guild_id) = &self.guild_id {
+            let message_guild = message
+                .metadata
+                .get("discord_guild_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string());
+            if message_guild.as_deref() != Some(guild_id) {
+                return false;
+            }
+        }
+
+        if !self.channel_ids.is_empty() {
+            let message_channel = message
+                .metadata
+                .get("discord_channel_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string());
+            match message_channel {
+                Some(id) if self.channel_ids.contains(&id) => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(chat_id) = &self.chat_id {
+            let message_chat = message
+                .metadata
+                .get("telegram_chat_id")
+                .and_then(|v| v.as_str());
+            if message_chat != Some(chat_id) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Resolve which agent should handle an inbound message.
+///
+/// Checks bindings in order. First match wins. Falls back to the default
+/// agent if no binding matches.
+pub fn resolve_agent_for_message(
+    bindings: &[Binding],
+    message: &crate::InboundMessage,
+    default_agent_id: &str,
+) -> crate::AgentId {
+    for binding in bindings {
+        if binding.matches(message) {
+            return std::sync::Arc::from(binding.agent_id.as_str());
+        }
+    }
+    std::sync::Arc::from(default_agent_id)
 }
 
 /// Messaging platform credentials (instance-level).
@@ -304,6 +367,8 @@ struct TomlBinding {
     channel: String,
     guild_id: Option<String>,
     chat_id: Option<String>,
+    #[serde(default)]
+    channel_ids: Vec<String>,
 }
 
 /// Resolve a value that might be an "env:VAR_NAME" reference.
@@ -345,8 +410,8 @@ impl Config {
         let instance_dir = std::env::var("SPACEBOT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                dirs::data_dir()
-                    .map(|d| d.join("spacebot"))
+                dirs::home_dir()
+                    .map(|d| d.join(".spacebot"))
                     .unwrap_or_else(|| PathBuf::from("./.spacebot"))
             });
 
@@ -566,6 +631,7 @@ impl Config {
                 channel: b.channel,
                 guild_id: b.guild_id,
                 chat_id: b.chat_id,
+                channel_ids: b.channel_ids,
             })
             .collect();
 

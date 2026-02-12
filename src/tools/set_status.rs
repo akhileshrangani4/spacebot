@@ -5,7 +5,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 /// Tool for setting worker status.
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct SetStatusTool {
     agent_id: AgentId,
     worker_id: WorkerId,
     channel_id: Option<ChannelId>,
-    event_tx: mpsc::Sender<ProcessEvent>,
+    event_tx: broadcast::Sender<ProcessEvent>,
 }
 
 impl SetStatusTool {
@@ -22,7 +22,7 @@ impl SetStatusTool {
         agent_id: AgentId,
         worker_id: WorkerId,
         channel_id: Option<ChannelId>,
-        event_tx: mpsc::Sender<ProcessEvent>,
+        event_tx: broadcast::Sender<ProcessEvent>,
     ) -> Self {
         Self {
             agent_id,
@@ -88,8 +88,7 @@ impl Tool for SetStatusTool {
             status: args.status.clone(),
         };
 
-        // Send without blocking
-        let _ = self.event_tx.try_send(event);
+        let _ = self.event_tx.send(event);
 
         Ok(SetStatusOutput {
             success: true,
@@ -104,7 +103,7 @@ pub fn set_status(
     agent_id: AgentId,
     worker_id: WorkerId,
     status: impl Into<String>,
-    event_tx: &mpsc::Sender<ProcessEvent>,
+    event_tx: &broadcast::Sender<ProcessEvent>,
 ) {
     let event = ProcessEvent::WorkerStatus {
         agent_id,
@@ -113,6 +112,5 @@ pub fn set_status(
         status: status.into(),
     };
 
-    // Send without blocking
-    let _ = event_tx.try_send(event);
+    let _ = event_tx.send(event);
 }

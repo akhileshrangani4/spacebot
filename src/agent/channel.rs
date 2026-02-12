@@ -44,6 +44,7 @@ pub struct ChannelState {
     pub active_workers: Arc<RwLock<HashMap<WorkerId, Worker>>>,
     pub status_block: Arc<RwLock<StatusBlock>>,
     pub deps: AgentDeps,
+    pub identity_context: String,
     pub branch_system_prompt: String,
     pub worker_system_prompt: String,
     pub max_concurrent_branches: usize,
@@ -82,6 +83,7 @@ impl Channel {
         deps: AgentDeps,
         config: ChannelConfig,
         system_prompt: impl Into<String>,
+        identity_context: impl Into<String>,
         branch_system_prompt: impl Into<String>,
         worker_system_prompt: impl Into<String>,
         response_tx: mpsc::Sender<OutboundResponse>,
@@ -102,6 +104,7 @@ impl Channel {
             active_workers: active_workers.clone(),
             status_block: status_block.clone(),
             deps: deps.clone(),
+            identity_context: identity_context.into(),
             branch_system_prompt: branch_system_prompt.into(),
             worker_system_prompt: worker_system_prompt.into(),
             max_concurrent_branches: config.max_concurrent_branches,
@@ -164,12 +167,17 @@ impl Channel {
             crate::MessageContent::Media { text, .. } => text.clone().unwrap_or_default(),
         };
 
-        // Build the system prompt with status block and identity context
+        // Build the system prompt with identity and status block
         let status_text = {
             let status = self.state.status_block.read().await;
             status.render()
         };
-        let mut system_prompt = self.system_prompt.clone();
+        let mut system_prompt = String::new();
+        if !self.state.identity_context.is_empty() {
+            system_prompt.push_str(&self.state.identity_context);
+            system_prompt.push_str("\n\n");
+        }
+        system_prompt.push_str(&self.system_prompt);
         if !status_text.is_empty() {
             system_prompt.push_str("\n\n## Current Status\n\n");
             system_prompt.push_str(&status_text);
@@ -212,9 +220,16 @@ impl Channel {
         }
 
         match result {
-            Ok(_response) => {
-                // The reply tool already sent the response to the user.
-                // The text response here is what the LLM said after all tool calls.
+            Ok(response) => {
+                // If the LLM returned text without using the reply tool, send it
+                // directly. Some models respond with text instead of tool calls.
+                let text = response.trim();
+                if !text.is_empty() {
+                    if let Err(error) = self.response_tx.send(OutboundResponse::Text(text.to_string())).await {
+                        tracing::error!(%error, channel_id = %self.id, "failed to send fallback reply");
+                    }
+                }
+
                 tracing::debug!(channel_id = %self.id, "channel turn completed");
             }
             Err(rig::completion::PromptError::MaxTurnsError { .. }) => {
@@ -377,7 +392,7 @@ pub async fn spawn_worker_from_state(
                     channel_id,
                     result: result_text,
                     notify: true,
-                }).await;
+                });
             }
             Err(error) => {
                 tracing::error!(worker_id = %worker_id, %error, "worker failed");
@@ -387,7 +402,7 @@ pub async fn spawn_worker_from_state(
                     channel_id,
                     result: format!("Worker failed: {error}"),
                     notify: true,
-                }).await;
+                });
             }
         }
     });

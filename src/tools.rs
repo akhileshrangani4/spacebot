@@ -52,7 +52,7 @@ use crate::{AgentId, ChannelId, OutboundResponse, ProcessEvent, WorkerId};
 use rig::tool::Tool as _;
 use rig::tool::server::{ToolServer, ToolServerHandle};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// Create the shared ToolServer for channels and branches.
 ///
@@ -109,7 +109,7 @@ pub fn create_worker_tool_server(
     agent_id: AgentId,
     worker_id: WorkerId,
     channel_id: Option<ChannelId>,
-    event_tx: mpsc::Sender<ProcessEvent>,
+    event_tx: broadcast::Sender<ProcessEvent>,
 ) -> ToolServerHandle {
     ToolServer::new()
         .tool(ShellTool::new())

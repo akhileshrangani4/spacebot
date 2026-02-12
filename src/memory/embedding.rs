@@ -1,6 +1,7 @@
 //! Embedding generation via fastembed.
 
 use crate::error::{LlmError, Result};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Embedding model wrapper with thread-safe sharing.
@@ -12,9 +13,13 @@ pub struct EmbeddingModel {
 }
 
 impl EmbeddingModel {
-    /// Create a new embedding model with the default all-MiniLM-L6-v2.
-    pub fn new() -> Result<Self> {
-        let model = fastembed::TextEmbedding::try_new(Default::default())
+    /// Create a new embedding model, storing downloaded model files in `cache_dir`.
+    pub fn new(cache_dir: &Path) -> Result<Self> {
+        let options = fastembed::InitOptions::default()
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_show_download_progress(true);
+
+        let model = fastembed::TextEmbedding::try_new(options)
             .map_err(|e| LlmError::EmbeddingFailed(e.to_string()))?;
 
         Ok(Self { model: Arc::new(model) })
@@ -49,7 +54,7 @@ impl EmbeddingModel {
 
 impl Default for EmbeddingModel {
     fn default() -> Self {
-        Self::new().expect("failed to initialize embedding model")
+        Self::new(Path::new(".fastembed_cache")).expect("failed to initialize embedding model")
     }
 }
 

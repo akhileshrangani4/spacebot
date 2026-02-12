@@ -2,8 +2,10 @@
 
 use anyhow::Context as _;
 use clap::Parser;
+use futures::StreamExt as _;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -17,6 +19,13 @@ struct Cli {
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
+}
+
+/// Tracks an active conversation channel and its message sender.
+struct ActiveChannel {
+    message_tx: mpsc::Sender<spacebot::InboundMessage>,
+    /// Retained so the outbound routing task stays alive.
+    _outbound_handle: tokio::task::JoinHandle<()>,
 }
 
 #[tokio::main]
@@ -54,8 +63,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Shared embedding model (stateless, agent-agnostic)
+    let embedding_cache_dir = config.instance_dir.join("embedding_cache");
     let embedding_model = Arc::new(
-        spacebot::memory::EmbeddingModel::new()
+        spacebot::memory::EmbeddingModel::new(&embedding_cache_dir)
             .context("failed to initialize embedding model")?
     );
 
@@ -66,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let mut agents: HashMap<spacebot::AgentId, spacebot::Agent> = HashMap::new();
 
     let shared_prompts_dir = config.prompts_dir();
+
+    spacebot::identity::scaffold_default_prompts(&shared_prompts_dir)
+        .await
+        .with_context(|| "failed to scaffold default prompts")?;
 
     for agent_config in &resolved_agents {
         tracing::info!(agent_id = %agent_config.id, "initializing agent");
@@ -95,12 +109,10 @@ async fn main() -> anyhow::Result<()> {
             embedding_model.clone(),
         ));
 
-        // Per-agent event bus
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        // Per-agent event bus (broadcast for fan-out to multiple channels)
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(256);
 
-        // Per-agent tool server with memory tools pre-registered.
-        // Channel-specific tools (reply, branch, etc.) are added dynamically per
-        // conversation turn via tools::add_channel_tools().
+        // Per-agent tool server with memory tools pre-registered
         let tool_server = spacebot::tools::create_channel_tool_server(memory_search.clone());
 
         let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
@@ -114,7 +126,10 @@ async fn main() -> anyhow::Result<()> {
             event_tx,
         };
 
-        // Load identity files from agent workspace
+        // Scaffold identity templates if missing, then load
+        spacebot::identity::scaffold_identity_files(&agent_config.workspace)
+            .await
+            .with_context(|| format!("failed to scaffold identity files for agent '{}'", agent_config.id))?;
         let identity = spacebot::identity::Identity::load(&agent_config.workspace).await;
 
         // Load prompts (agent overrides, then shared)
@@ -138,40 +153,180 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(agent_count = agents.len(), "all agents initialized");
 
-    // Initialize messaging adapters from config
+    // Initialize messaging adapters
     let mut messaging_manager = spacebot::messaging::MessagingManager::new();
 
     if let Some(discord_config) = &config.messaging.discord {
         if discord_config.enabled {
+            let discord_bindings: Vec<&spacebot::config::Binding> = config
+                .bindings
+                .iter()
+                .filter(|b| b.channel == "discord")
+                .collect();
+
             let guild_filter: Option<Vec<u64>> = {
-                let discord_bindings: Vec<u64> = config
-                    .bindings
+                let guild_ids: Vec<u64> = discord_bindings
                     .iter()
-                    .filter(|b| b.channel == "discord")
                     .filter_map(|b| b.guild_id.as_ref()?.parse::<u64>().ok())
                     .collect();
 
-                if discord_bindings.is_empty() {
+                if guild_ids.is_empty() {
                     None
                 } else {
-                    Some(discord_bindings)
+                    Some(guild_ids)
                 }
+            };
+
+            let channel_filter: HashMap<u64, Vec<u64>> = {
+                let mut filter: HashMap<u64, Vec<u64>> = HashMap::new();
+                for binding in &discord_bindings {
+                    if let Some(guild_id) = binding.guild_id.as_ref().and_then(|g| g.parse::<u64>().ok()) {
+                        if !binding.channel_ids.is_empty() {
+                            let channel_ids: Vec<u64> = binding
+                                .channel_ids
+                                .iter()
+                                .filter_map(|id| id.parse::<u64>().ok())
+                                .collect();
+                            filter.entry(guild_id).or_default().extend(channel_ids);
+                        }
+                    }
+                }
+                filter
             };
 
             let adapter = spacebot::messaging::discord::DiscordAdapter::new(
                 &discord_config.token,
                 guild_filter,
+                channel_filter,
             );
             messaging_manager.register(adapter);
         }
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    let messaging_manager = Arc::new(messaging_manager);
 
-    tracing::info!("shutdown signal received");
+    // Start all messaging adapters and get the merged inbound stream
+    let mut inbound_stream = messaging_manager
+        .start()
+        .await
+        .context("failed to start messaging adapters")?;
+
+    tracing::info!("messaging adapters started");
+
+    let default_agent_id = config.default_agent_id().to_string();
+    let bindings = config.bindings.clone();
+
+    // Active conversation channels: conversation_id -> ActiveChannel
+    let mut active_channels: HashMap<String, ActiveChannel> = HashMap::new();
+
+    // Main event loop: route inbound messages to agent channels
+    loop {
+        tokio::select! {
+            Some(mut message) = inbound_stream.next() => {
+                // Resolve which agent handles this message
+                let agent_id = spacebot::config::resolve_agent_for_message(
+                    &bindings,
+                    &message,
+                    &default_agent_id,
+                );
+                message.agent_id = Some(agent_id.clone());
+
+                let conversation_id = message.conversation_id.clone();
+
+                // Find or create a channel for this conversation
+                if !active_channels.contains_key(&conversation_id) {
+                    let Some(agent) = agents.get(&agent_id) else {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            conversation_id = %conversation_id,
+                            "message routed to unknown agent, dropping"
+                        );
+                        continue;
+                    };
+
+                    // Create outbound response channel
+                    let (response_tx, mut response_rx) = mpsc::channel::<spacebot::OutboundResponse>(32);
+
+                    // Subscribe to the agent's event bus
+                    let event_rx = agent.deps.event_tx.subscribe();
+
+                    let channel_id: spacebot::ChannelId = Arc::from(conversation_id.as_str());
+
+                    let (channel, channel_tx) = spacebot::agent::channel::Channel::new(
+                        channel_id,
+                        agent.deps.clone(),
+                        spacebot::agent::channel::ChannelConfig {
+                            max_concurrent_branches: agent.config.max_concurrent_branches,
+                            max_turns: agent.config.max_turns,
+                        },
+                        &agent.prompts.channel,
+                        agent.identity.render(),
+                        &agent.prompts.branch,
+                        &agent.prompts.worker,
+                        response_tx,
+                        event_rx,
+                    );
+
+                    // Spawn the channel's event loop
+                    tokio::spawn(async move {
+                        if let Err(error) = channel.run().await {
+                            tracing::error!(%error, "channel event loop failed");
+                        }
+                    });
+
+                    // Spawn outbound response routing: reads from response_rx,
+                    // sends to the messaging adapter
+                    let messaging_for_outbound = messaging_manager.clone();
+                    let outbound_message = message.clone();
+                    let outbound_conversation_id = conversation_id.clone();
+                    let outbound_handle = tokio::spawn(async move {
+                        while let Some(response) = response_rx.recv().await {
+                            tracing::info!(
+                                conversation_id = %outbound_conversation_id,
+                                "routing outbound response to messaging adapter"
+                            );
+                            if let Err(error) = messaging_for_outbound
+                                .respond(&outbound_message, response)
+                                .await
+                            {
+                                tracing::error!(%error, "failed to send outbound response");
+                            }
+                        }
+                    });
+
+                    active_channels.insert(conversation_id.clone(), ActiveChannel {
+                        message_tx: channel_tx,
+                        _outbound_handle: outbound_handle,
+                    });
+
+                    tracing::info!(
+                        conversation_id = %conversation_id,
+                        agent_id = %agent_id,
+                        "new channel created"
+                    );
+                }
+
+                // Forward the message to the channel
+                if let Some(active) = active_channels.get(&conversation_id) {
+                    if let Err(error) = active.message_tx.send(message).await {
+                        tracing::error!(
+                            conversation_id = %conversation_id,
+                            %error,
+                            "failed to forward message to channel"
+                        );
+                        active_channels.remove(&conversation_id);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutdown signal received");
+                break;
+            }
+        }
+    }
 
     // Graceful shutdown
+    drop(active_channels);
     messaging_manager.shutdown().await;
 
     for (agent_id, agent) in agents {

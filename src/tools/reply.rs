@@ -74,12 +74,20 @@ impl Tool for ReplyTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        tracing::info!(
+            conversation_id = %self.conversation_id,
+            content_len = args.content.len(),
+            "reply tool called"
+        );
+
         let response = OutboundResponse::Text(args.content.clone());
 
         self.response_tx
             .send(response)
             .await
             .map_err(|e| ReplyError(format!("failed to send reply: {e}")))?;
+
+        tracing::debug!(conversation_id = %self.conversation_id, "reply sent to outbound channel");
 
         Ok(ReplyOutput {
             success: true,

@@ -42,7 +42,11 @@ Add the following to your `config.toml`:
 
 ```toml
 [llm]
-anthropic_key = "env:ANTHROPIC_API_KEY"
+openrouter_key = "env:OPENROUTER_API_KEY"
+
+[defaults.routing]
+channel = "openrouter/anthropic/claude-sonnet-4-20250514"
+worker = "openrouter/anthropic/claude-haiku-4.5-20250514"
 
 [messaging.discord]
 enabled = true
@@ -59,14 +63,43 @@ channel = "discord"
 guild_id = "YOUR_GUILD_ID_HERE"
 ```
 
-Set the environment variable:
+Set the environment variables:
 
 ```bash
 export DISCORD_BOT_TOKEN="your-bot-token-here"
-export ANTHROPIC_API_KEY="your-api-key-here"
+export OPENROUTER_API_KEY="your-openrouter-key-here"
 ```
 
-The `token` field supports `env:` prefix to read from environment variables at startup — tokens are never stored in plaintext in config.
+### LLM Providers
+
+Spacebot supports three providers. Use whichever you prefer:
+
+| Provider | Config key | Env var | Model prefix |
+|----------|-----------|---------|-------------|
+| OpenRouter | `openrouter_key` | `OPENROUTER_API_KEY` | `openrouter/` |
+| Anthropic | `anthropic_key` | `ANTHROPIC_API_KEY` | `anthropic/` |
+| OpenAI | `openai_key` | `OPENAI_API_KEY` | `openai/` |
+
+OpenRouter is convenient because it gives you access to all models through a single API key. Model names use the format `openrouter/<provider>/<model>`:
+
+```toml
+[defaults.routing]
+channel = "openrouter/anthropic/claude-sonnet-4-20250514"
+worker = "openrouter/anthropic/claude-haiku-4.5-20250514"
+cortex = "openrouter/anthropic/claude-haiku-4.5-20250514"
+```
+
+For direct API access without OpenRouter:
+
+```toml
+[llm]
+anthropic_key = "env:ANTHROPIC_API_KEY"
+
+[defaults.routing]
+channel = "anthropic/claude-sonnet-4-20250514"
+```
+
+The `token` and key fields support `env:` prefix to read from environment variables at startup — credentials are never stored in plaintext in config.
 
 ### Multiple Servers
 
@@ -79,7 +112,8 @@ default = true
 
 [[agents]]
 id = "dev-bot"
-channel_model = "anthropic/claude-sonnet-4-20250514"
+[agents.routing]
+channel = "openrouter/anthropic/claude-sonnet-4-20250514"
 
 [[bindings]]
 agent_id = "main"

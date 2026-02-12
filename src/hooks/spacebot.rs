@@ -3,7 +3,7 @@
 use crate::{AgentId, ProcessEvent, ProcessId, ProcessType};
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, CompletionResponse, Message};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 /// Hook for observing agent behavior and sending events.
 #[derive(Clone)]
@@ -11,7 +11,7 @@ pub struct SpacebotHook {
     agent_id: AgentId,
     process_id: ProcessId,
     process_type: ProcessType,
-    event_tx: mpsc::Sender<ProcessEvent>,
+        event_tx: broadcast::Sender<ProcessEvent>,
 }
 
 impl SpacebotHook {
@@ -20,7 +20,7 @@ impl SpacebotHook {
         agent_id: AgentId,
         process_id: ProcessId,
         process_type: ProcessType,
-        event_tx: mpsc::Sender<ProcessEvent>,
+    event_tx: broadcast::Sender<ProcessEvent>,
     ) -> Self {
         Self {
             agent_id,
@@ -37,7 +37,7 @@ impl SpacebotHook {
             process_id: self.process_id.clone(),
             status: status.into(),
         };
-        let _ = self.event_tx.try_send(event);
+        let _ = self.event_tx.send(event);
     }
 
     /// Scan content for potential secret leaks.
@@ -113,7 +113,7 @@ where
             process_id: self.process_id.clone(),
             tool_name: tool_name.to_string(),
         };
-        let _ = self.event_tx.try_send(event);
+        let _ = self.event_tx.send(event);
 
         tracing::debug!(
             process_id = %self.process_id,
@@ -140,7 +140,6 @@ where
                 leak = %leak,
                 "potential secret leak detected in tool output"
             );
-            // Return the result but log the warning
         }
 
         let event = ProcessEvent::ToolCompleted {
@@ -149,7 +148,7 @@ where
             tool_name: tool_name.to_string(),
             result: result.to_string(),
         };
-        let _ = self.event_tx.try_send(event);
+        let _ = self.event_tx.send(event);
 
         tracing::debug!(
             process_id = %self.process_id,

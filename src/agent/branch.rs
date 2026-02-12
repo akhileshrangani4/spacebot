@@ -99,7 +99,7 @@ impl Branch {
             branch_id: self.id,
             channel_id: self.channel_id.clone(),
             conclusion: conclusion.clone(),
-        }).await;
+        });
         
         tracing::info!(branch_id = %self.id, "branch completed");
         

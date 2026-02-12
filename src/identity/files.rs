@@ -102,6 +102,60 @@ async fn load_prompt(name: &str, workspace: &Path, shared_prompts_dir: &Path) ->
         .map_err(Into::into)
 }
 
+/// Default identity file templates for new agents.
+const DEFAULT_IDENTITY_FILES: &[(&str, &str)] = &[
+    ("SOUL.md", "<!-- Define this agent's soul: personality, values, communication style, boundaries. -->\n"),
+    ("IDENTITY.md", "<!-- Define this agent's identity: name, nature, purpose. -->\n"),
+    ("USER.md", "<!-- Describe the human this agent interacts with: name, preferences, context. -->\n"),
+];
+
+/// Write template identity files into an agent's workspace if they don't already exist.
+///
+/// Only writes files that are missing — existing files are left untouched.
+pub async fn scaffold_identity_files(workspace: &Path) -> Result<()> {
+    for (filename, content) in DEFAULT_IDENTITY_FILES {
+        let target = workspace.join(filename);
+        if !target.exists() {
+            tokio::fs::write(&target, content)
+                .await
+                .with_context(|| format!("failed to write identity template: {}", target.display()))?;
+            tracing::info!(path = %target.display(), "wrote identity template");
+        }
+    }
+
+    Ok(())
+}
+
+/// Default prompts embedded at compile time so the binary is self-contained.
+const DEFAULT_PROMPTS: &[(&str, &str)] = &[
+    ("CHANNEL.md", include_str!("../../prompts/CHANNEL.md")),
+    ("BRANCH.md", include_str!("../../prompts/BRANCH.md")),
+    ("WORKER.md", include_str!("../../prompts/WORKER.md")),
+    ("CORTEX.md", include_str!("../../prompts/CORTEX.md")),
+    ("COMPACTOR.md", include_str!("../../prompts/COMPACTOR.md")),
+];
+
+/// Copy default prompts into the shared prompts directory if they don't already exist.
+///
+/// Only writes files that are missing — existing files (user customizations) are left untouched.
+pub async fn scaffold_default_prompts(shared_prompts_dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(shared_prompts_dir)
+        .await
+        .with_context(|| format!("failed to create prompts dir: {}", shared_prompts_dir.display()))?;
+
+    for (filename, content) in DEFAULT_PROMPTS {
+        let target = shared_prompts_dir.join(filename);
+        if !target.exists() {
+            tokio::fs::write(&target, content)
+                .await
+                .with_context(|| format!("failed to write default prompt: {}", target.display()))?;
+            tracing::info!(path = %target.display(), "wrote default prompt");
+        }
+    }
+
+    Ok(())
+}
+
 /// Load a file if it exists, returning None if missing.
 async fn load_optional_file(path: &Path) -> Option<String> {
     tokio::fs::read_to_string(path).await.ok()
