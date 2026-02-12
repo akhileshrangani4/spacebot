@@ -56,6 +56,7 @@ pub struct Prompts {
     pub compactor: String,
     pub memory_persistence: String,
     pub ingestion: String,
+    pub cortex_bulletin: String,
 }
 
 impl Prompts {
@@ -69,6 +70,7 @@ impl Prompts {
             compactor: load_prompt("COMPACTOR", workspace, shared_prompts_dir).await?,
             memory_persistence: load_prompt("MEMORY_PERSISTENCE", workspace, shared_prompts_dir).await?,
             ingestion: load_prompt("INGESTION", workspace, shared_prompts_dir).await?,
+            cortex_bulletin: load_prompt("CORTEX_BULLETIN", workspace, shared_prompts_dir).await?,
         })
     }
 }
@@ -139,6 +141,7 @@ const DEFAULT_PROMPTS: &[(&str, &str)] = &[
     ("COMPACTOR.md", include_str!("../../prompts/COMPACTOR.md")),
     ("MEMORY_PERSISTENCE.md", include_str!("../../prompts/MEMORY_PERSISTENCE.md")),
     ("INGESTION.md", include_str!("../../prompts/INGESTION.md")),
+    ("CORTEX_BULLETIN.md", include_str!("../../prompts/CORTEX_BULLETIN.md")),
 ];
 
 /// Copy default prompts into the shared prompts directory if they don't already exist.

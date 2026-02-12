@@ -68,10 +68,13 @@ The compaction worker runs alongside the channel without blocking it. Compacted 
 
 ### The Cortex
 
-System-level observer across all channels. Watches signals (not raw conversation data). Consolidates memories, manages decay, triggers routines. Never compacts because its context stays small.
+System-level observer. Primary job: generate the **memory bulletin** — a periodically refreshed, LLM-curated summary of the agent's current knowledge. Runs on a configurable interval (default 60 min), uses `memory_recall` to query across multiple dimensions (identity, events, decisions, preferences), synthesizes into a ~500 word briefing cached in `RuntimeConfig::memory_bulletin`. Every channel reads this on every turn via `ArcSwap`.
 
-**Tools:** memory_consolidate, system_monitor  
-**Context:** Rolling window of high-level activity signals
+Also observes system-wide signals for future health monitoring and memory consolidation.
+
+**Tools (bulletin generation):** memory_recall, memory_save  
+**Tools (future health monitoring):** memory_consolidate, system_monitor  
+**Context:** Fresh per bulletin run. No compaction needed.
 
 ### Status Injection
 

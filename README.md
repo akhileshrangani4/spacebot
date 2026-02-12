@@ -132,13 +132,13 @@ Because the compactor is programmatic (not an LLM), it's cheap. It's just watchi
 
 ### The Cortex
 
-The cortex is the inner monologue of the entire system. It watches what's happening across all channels and makes system-level decisions.
+The cortex is the inner monologue of the entire system. Its primary job is generating the **memory bulletin** -- a periodically refreshed, LLM-curated summary of the agent's current knowledge that gets injected into every channel's system prompt.
 
-Where compactors handle per-channel compaction, the cortex operates at the system level -- observing patterns across channels, consolidating related memories, managing associations and decay, triggering routines. Compactors see one conversation. The cortex sees the whole picture.
+On a configurable interval (default: 60 minutes), the cortex creates a fresh agent with `memory_recall`, makes several targeted queries across the memory graph (identity, recent events, decisions, preferences, important context), and synthesizes the results into a ~500 word briefing. This bulletin is cached and read by every channel on every turn -- giving all conversations ambient awareness of who the user is, what's been decided, and what's happening, without needing explicit recall.
 
-The cortex works on a rolling window of high-level activity. It sees signals from channels and compactors -- not raw conversation data or tool output. It never compacts because its context never fills up.
+This is the equivalent of OpenClaw's manually-managed `MEMORY.md`, but dynamic and maintained by an LLM against a structured memory graph. The bulletin is generated on startup and refreshed hourly.
 
-At small scale, there's one cortex. At large scale (100+ channels), multiple cortex instances can load-balance across channels, all writing to the same memory store.
+Beyond the bulletin, the cortex also observes system-wide activity via signals for future health monitoring, memory consolidation, and cross-channel coherence. See [docs/cortex.md](docs/cortex.md) for the full design.
 
 ## Why Nothing Ever Blocks
 
@@ -148,7 +148,7 @@ The whole design exists to prevent any process from ever going dark:
 - **Branches** fork the context, think, and return a conclusion. The channel keeps receiving messages while branches are active.
 - **Workers** run independently. The channel knows they exist but doesn't wait for them.
 - **Compactors** are programmatic. They monitor context size and trigger compaction workers in the background.
-- **The cortex** only processes high-level signals. Its context stays small.
+- **The cortex** generates the memory bulletin on its own schedule. Fresh context per run, no compaction needed.
 
 No process in the system ever stops to compact, ever blocks on a tool call, or ever goes unresponsive.
 

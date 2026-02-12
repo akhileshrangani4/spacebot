@@ -71,25 +71,35 @@ impl MemorySearch {
         let mut fts_results = Vec::new();
         let mut graph_results = Vec::new();
         
-        // 1. Full-text search via LanceDB (replaces SQLite LIKE)
-        let fts_matches = self.embedding_table.text_search(query, config.max_results_per_source).await?;
-        for (memory_id, score) in fts_matches {
-            // Load the memory from SQLite
-            if let Some(memory) = self.store.load(&memory_id).await? {
-                fts_results.push(ScoredMemory { memory, score: score as f64 });
+        // 1. Full-text search via LanceDB
+        // FTS requires an inverted index. If the index doesn't exist yet (empty
+        // table, first run) this will fail — fall back to vector + graph search.
+        match self.embedding_table.text_search(query, config.max_results_per_source).await {
+            Ok(fts_matches) => {
+                for (memory_id, score) in fts_matches {
+                    if let Some(memory) = self.store.load(&memory_id).await? {
+                        fts_results.push(ScoredMemory { memory, score: score as f64 });
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "FTS search unavailable, falling back to vector + graph");
             }
         }
         
         // 2. Vector similarity search via LanceDB
-        // Generate query embedding using the shared model
-        let query_embedding = self.embedding_model.embed_one_blocking(query)?;
-        let vector_matches = self.embedding_table.vector_search(&query_embedding, config.max_results_per_source).await?;
-        for (memory_id, distance) in vector_matches {
-            // Convert distance to similarity score (cosine distance -> similarity)
-            let similarity = 1.0 - distance;
-            // Load the memory from SQLite
-            if let Some(memory) = self.store.load(&memory_id).await? {
-                vector_results.push(ScoredMemory { memory, score: similarity as f64 });
+        let query_embedding = self.embedding_model.embed_one(query).await?;
+        match self.embedding_table.vector_search(&query_embedding, config.max_results_per_source).await {
+            Ok(vector_matches) => {
+                for (memory_id, distance) in vector_matches {
+                    let similarity = 1.0 - distance;
+                    if let Some(memory) = self.store.load(&memory_id).await? {
+                        vector_results.push(ScoredMemory { memory, score: similarity as f64 });
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "vector search unavailable, falling back to graph only");
             }
         }
         
@@ -216,7 +226,9 @@ impl Default for SearchConfig {
         Self {
             max_results_per_source: 50,
             rrf_k: 60.0,
-            min_score: 0.3,
+            // RRF scores are 1/(k+rank), so with k=60 the max single-source
+            // score is ~0.016. Set threshold low enough to not discard everything.
+            min_score: 0.0,
             max_graph_depth: 2,
         }
     }

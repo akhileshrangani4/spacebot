@@ -225,6 +225,12 @@ impl Channel {
             system_prompt.push_str(&identity_context);
             system_prompt.push_str("\n\n");
         }
+        let memory_bulletin = rc.memory_bulletin.load();
+        if !memory_bulletin.is_empty() {
+            system_prompt.push_str("## Memory Context\n\n");
+            system_prompt.push_str(&memory_bulletin);
+            system_prompt.push_str("\n\n");
+        }
         system_prompt.push_str(&channel_prompt);
         let skills_prompt = skills.render_channel_prompt();
         if !skills_prompt.is_empty() {

@@ -251,10 +251,15 @@ impl SpacebotModel {
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_body: serde_json::Value = response
-            .json()
+        let response_text = response
+            .text()
             .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+
+        let response_body: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| CompletionError::ProviderError(format!(
+                "Anthropic response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
+            )))?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
@@ -331,10 +336,15 @@ impl SpacebotModel {
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_body: serde_json::Value = response
-            .json()
+        let response_text = response
+            .text()
             .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+
+        let response_body: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| CompletionError::ProviderError(format!(
+                "OpenAI response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
+            )))?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
@@ -413,10 +423,15 @@ impl SpacebotModel {
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_body: serde_json::Value = response
-            .json()
+        let response_text = response
+            .text()
             .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+
+        let response_body: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| CompletionError::ProviderError(format!(
+                "OpenRouter response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
+            )))?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
@@ -640,13 +655,23 @@ fn convert_image_openai(image: &Image) -> Option<serde_json::Value> {
     }
 }
 
+/// Truncate a response body for error messages to avoid dumping megabytes of HTML.
+fn truncate_body(body: &str) -> &str {
+    let limit = 500;
+    if body.len() <= limit {
+        body
+    } else {
+        &body[..limit]
+    }
+}
+
 // --- Response parsing ---
 
 fn make_tool_call(id: String, name: String, arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id,
         call_id: None,
-        function: ToolFunction { name, arguments },
+        function: ToolFunction { name: name.trim().to_string(), arguments },
         signature: None,
         additional_params: None,
     }

@@ -221,6 +221,12 @@ impl Tool for MemorySaveTool {
             .await
             .map_err(|e| MemorySaveError(format!("Failed to store embedding: {e}")))?;
 
+        // Ensure the FTS index exists so full_text_search queries work.
+        // Safe to call repeatedly — no-ops if the index already exists.
+        if let Err(error) = self.memory_search.embedding_table().ensure_fts_index().await {
+            tracing::warn!(%error, "failed to ensure FTS index after memory save");
+        }
+
         Ok(MemorySaveOutput {
             memory_id: memory.id,
             success: true,

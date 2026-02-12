@@ -3,7 +3,7 @@
 use crate::error::{DbError, Result};
 use arrow_array::{Array, RecordBatchIterator};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float64Type, Float32Type};
+use arrow_array::types::Float32Type;
 use futures::TryStreamExt;
 use std::sync::Arc;
 
@@ -68,7 +68,6 @@ impl EmbeddingTable {
         }
         
         use arrow_array::{FixedSizeListArray, RecordBatch, StringArray};
-        use arrow_array::types::Float32Type;
         
         let schema = Self::schema();
         
@@ -153,12 +152,12 @@ impl EmbeddingTable {
         for batch in results {
             if let (Some(id_col), Some(dist_col)) = (batch.column_by_name("id"), batch.column_by_name("_distance")) {
                 let ids: &arrow_array::StringArray = id_col.as_string::<i32>();
-                let dists: &arrow_array::PrimitiveArray<Float64Type> = dist_col.as_primitive();
+                let dists: &arrow_array::PrimitiveArray<Float32Type> = dist_col.as_primitive();
                 
                 for i in 0..ids.len() {
                     if ids.is_valid(i) && dists.is_valid(i) {
                         let id = ids.value(i).to_string();
-                        let distance = dists.value(i) as f32;
+                        let distance = dists.value(i);
                         matches.push((id, distance));
                     }
                 }
@@ -191,12 +190,12 @@ impl EmbeddingTable {
         for batch in results {
             if let (Some(id_col), Some(score_col)) = (batch.column_by_name("id"), batch.column_by_name("_score")) {
                 let ids: &arrow_array::StringArray = id_col.as_string::<i32>();
-                let scores: &arrow_array::PrimitiveArray<Float64Type> = score_col.as_primitive();
+                let scores: &arrow_array::PrimitiveArray<Float32Type> = score_col.as_primitive();
                 
                 for i in 0..ids.len() {
                     if ids.is_valid(i) && scores.is_valid(i) {
                         let id = ids.value(i).to_string();
-                        let score = scores.value(i) as f32;
+                        let score = scores.value(i);
                         matches.push((id, score));
                     }
                 }
@@ -216,14 +215,37 @@ impl EmbeddingTable {
             .await
             .map_err(|e| DbError::LanceDb(format!("Failed to create vector index: {}", e)))?;
         
-        // Create FTS index on content column using default FTS options
-        self.table
+        self.ensure_fts_index().await?;
+        
+        Ok(())
+    }
+    
+    /// Ensure the FTS index exists on the content column.
+    ///
+    /// LanceDB requires an inverted index for `full_text_search()` queries.
+    /// This is safe to call multiple times — if the index already exists, the
+    /// error is silently ignored.
+    pub async fn ensure_fts_index(&self) -> Result<()> {
+        match self.table
             .create_index(&["content"], lancedb::index::Index::FTS(Default::default()))
             .execute()
             .await
-            .map_err(|e| DbError::LanceDb(format!("Failed to create FTS index: {}", e)))?;
-        
-        Ok(())
+        {
+            Ok(()) => {
+                tracing::debug!("FTS index created on content column");
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                // LanceDB returns an error if the index already exists
+                if message.contains("already") || message.contains("index") {
+                    tracing::trace!("FTS index already exists");
+                    Ok(())
+                } else {
+                    Err(DbError::LanceDb(format!("Failed to create FTS index: {}", message)).into())
+                }
+            }
+        }
     }
     
     /// Get the Arrow schema for the embeddings table.

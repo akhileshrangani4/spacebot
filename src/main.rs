@@ -107,6 +107,11 @@ async fn main() -> anyhow::Result<()> {
             .await
             .with_context(|| format!("failed to init embeddings for agent '{}'", agent_config.id))?;
 
+        // Ensure FTS index exists for full-text search queries
+        if let Err(error) = embedding_table.ensure_fts_index().await {
+            tracing::warn!(%error, agent = %agent_config.id, "failed to create FTS index");
+        }
+
         let memory_search = Arc::new(spacebot::memory::MemorySearch::new(
             memory_store,
             embedding_table,
@@ -313,6 +318,14 @@ async fn main() -> anyhow::Result<()> {
             _ingestion_handles.push(handle);
             tracing::info!(agent_id = %agent_id, "memory ingestion loop started");
         }
+    }
+
+    // Start cortex bulletin loops for each agent
+    let mut _cortex_handles = Vec::new();
+    for (agent_id, agent) in &agents {
+        let handle = spacebot::agent::cortex::spawn_bulletin_loop(agent.deps.clone());
+        _cortex_handles.push(handle);
+        tracing::info!(agent_id = %agent_id, "cortex bulletin loop started");
     }
 
     let default_agent_id = config.default_agent_id().to_string();
